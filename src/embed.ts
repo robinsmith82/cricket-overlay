@@ -70,7 +70,13 @@ export function renderEmbedScore(matchId: string, scope: string): string {
  * the manual stream-start timestamp, embeds YouTube. If the YouTube URL isn't
  * set or the event index is out of range, renders a friendly fallback.
  */
-export async function renderEmbedClip(env: Env, matchId: string, scope: string, eventIdx: number): Promise<string> {
+export async function renderEmbedClip(
+  env: Env,
+  matchId: string,
+  scope: string,
+  eventIdx: number,
+  smartCaption?: string,
+): Promise<string> {
   const [events, youtube] = await Promise.all([readEvents(env, matchId), readYouTube(env, scope)]);
   const evt = Number.isFinite(eventIdx) && eventIdx >= 0 && eventIdx < events.length ? events[eventIdx] : null;
 
@@ -83,7 +89,31 @@ export async function renderEmbedClip(env: Env, matchId: string, scope: string, 
 
   const offset = Math.max(0, Math.floor((evt.ts - youtube.startedAt) / 1000));
   const startSec = Math.max(0, offset - 3); // jump in 3s before the moment
-  const caption = describe(evt);
+  // Bound the iframe so shared clips stop at a sensible point instead of
+  // playing into the next over. Source of truth, in priority order:
+  //   1. evt.endTs — set explicitly (e.g. by a manual scorer stamp).
+  //   2. The next event in the chronological list — its ts becomes our end.
+  //   3. A 20-second fallback if neither exists.
+  // Then clamp to [start+8, start+60] so a stale 'next' never produces a
+  // 20-minute "clip" and a same-second 'next' doesn't blink past the moment.
+  const FALLBACK_DURATION_S = 20;
+  const MAX_DURATION_S = 60;
+  const MIN_DURATION_S = 8;
+  let endSec: number | null = null;
+  if (evt.endTs && evt.endTs > evt.ts) {
+    endSec = Math.floor((evt.endTs - youtube.startedAt) / 1000);
+  } else {
+    const nextEvt = events[eventIdx + 1];
+    if (nextEvt && nextEvt.ts > evt.ts) {
+      endSec = Math.floor((nextEvt.ts - youtube.startedAt) / 1000);
+    }
+  }
+  if (endSec === null) endSec = startSec + FALLBACK_DURATION_S;
+  endSec = Math.min(endSec, startSec + MAX_DURATION_S);
+  endSec = Math.max(endSec, startSec + MIN_DURATION_S);
+  // Prefer the AI-written caption when supplied; otherwise fall back to the
+  // mechanical describe() line.
+  const caption = (smartCaption && smartCaption.trim()) ? smartCaption.trim() : describe(evt);
 
   return `<!doctype html>
 <html lang="en">
@@ -104,7 +134,7 @@ export async function renderEmbedClip(env: Env, matchId: string, scope: string, 
 <body>
 <div class="wrap">
   <div class="frame">
-    <iframe src="https://www.youtube.com/embed/${encodeURIComponent(youtube.videoId)}?start=${startSec}&autoplay=0&rel=0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+    <iframe src="https://www.youtube.com/embed/${encodeURIComponent(youtube.videoId)}?start=${startSec}&end=${endSec}&autoplay=0&rel=0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
   </div>
   <div class="caption">
     <div class="over">Over ${escapeHtml(evt.over)} · innings ${evt.innings}</div>
@@ -115,7 +145,8 @@ export async function renderEmbedClip(env: Env, matchId: string, scope: string, 
 </html>`;
 }
 
-function describe(e: { type: string; batter?: string; bowler?: string; runs?: number; context?: string }): string {
+function describe(e: { type: string; batter?: string; bowler?: string; runs?: number; context?: string; note?: string; manual?: boolean }): string {
+  if (e.manual && e.note) return e.note;
   const who = e.batter ? e.batter : 'Batter';
   switch (e.type) {
     case 'wicket': return `${who} dismissed${e.context ? ' — ' + e.context : ''}${e.bowler ? ' (b ' + e.bowler + ')' : ''}`;
@@ -124,6 +155,7 @@ function describe(e: { type: string; batter?: string; bowler?: string; runs?: nu
     case 'fifty': return `${who} brings up fifty${e.runs ? ' (' + e.runs + '*)' : ''}`;
     case 'hundred': return `${who} brings up a HUNDRED${e.runs ? ' (' + e.runs + '*)' : ''}`;
     case 'team-milestone': return `Team passes ${e.runs}`;
+    case 'moment': return e.note ? e.note : 'Stamped moment';
     default: return e.type;
   }
 }

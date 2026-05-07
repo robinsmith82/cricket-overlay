@@ -2,13 +2,16 @@ import type { Env, Score } from './types';
 
 export type MatchEvent = {
   ts: number;            // wall-clock ms when the event was detected
-  type: 'wicket' | '4' | '6' | 'fifty' | 'hundred' | 'team-milestone';
+  type: 'wicket' | '4' | '6' | 'fifty' | 'hundred' | 'team-milestone' | 'moment';
   over: string;          // e.g. "12.3"
   innings: number;
   batter?: string;
   bowler?: string;
   runs?: number;         // for milestone events
   context?: string;      // freeform e.g. "c PATEL b KHAN"
+  endTs?: number;        // explicit clip end (ms wall-clock); used by /embed/clip
+  note?: string;         // freeform scorer caption (mainly for type='moment')
+  manual?: boolean;      // true when stamped by an admin rather than scrape-detected
 };
 
 function eventsKey(matchId: string): string {
@@ -22,6 +25,27 @@ export async function readEvents(env: Env, matchId: string): Promise<MatchEvent[
   const raw = await env.CRICKET_CACHE.get(eventsKey(matchId));
   if (!raw) return [];
   try { return JSON.parse(raw) as MatchEvent[]; } catch { return []; }
+}
+
+/**
+ * Append a manual event and auto-close the most-recent open manual event by
+ * setting its `endTs` to this event's `ts`. Returns the full updated list.
+ *
+ * Used by `POST /[scope]/api/admin/stamp/:matchId` — back-to-back stamps
+ * therefore self-bound for `/embed/clip` without the scorer marking an end.
+ */
+export async function appendEvent(env: Env, matchId: string, evt: MatchEvent): Promise<MatchEvent[]> {
+  const existing = await readEvents(env, matchId);
+  for (let i = existing.length - 1; i >= 0; i--) {
+    const e = existing[i];
+    if (e.manual && !e.endTs) {
+      existing[i] = { ...e, endTs: evt.ts };
+      break;
+    }
+  }
+  const combined = existing.concat(evt);
+  await env.CRICKET_CACHE.put(eventsKey(matchId), JSON.stringify(combined));
+  return combined;
 }
 
 type LastSeen = {

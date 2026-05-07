@@ -1,6 +1,7 @@
 import type { Env } from './types';
 import { readEvents, type MatchEvent } from './events';
 import { readYouTube } from './archive';
+import { isAdmin } from './admin';
 
 const SCOPE_LABELS: Record<string, string> = {
   '3s': '3rd XI',
@@ -14,15 +15,19 @@ const TYPE_LABELS: Record<MatchEvent['type'], { label: string; emoji: string; co
   fifty: { label: 'FIFTY', emoji: '⭐', color: '#ffd23a' },
   hundred: { label: 'HUNDRED', emoji: '💯', color: '#ffd23a' },
   'team-milestone': { label: 'TEAM', emoji: '📈', color: '#3ddc84' },
+  moment: { label: 'MOMENT', emoji: '⭐', color: '#c9b46c' },
 };
 
-export async function renderHighlights(env: Env, matchId: string, scope: string): Promise<string> {
+export async function renderHighlights(env: Env, matchId: string, scope: string, url?: URL): Promise<string> {
   const [events, youtube] = await Promise.all([
     readEvents(env, matchId),
     readYouTube(env, scope),
   ]);
   const scopeLabel = SCOPE_LABELS[scope] ?? '';
   const safeId = matchId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const admin = !!url && isAdmin(env, url, scope);
+  const adminKey = admin ? (url!.searchParams.get('key') ?? '') : '';
+  const stampPath = `${scope ? '/' + scope : ''}/api/admin/stamp/${encodeURIComponent(safeId)}`;
 
   const cards = events.map((e) => {
     const meta = TYPE_LABELS[e.type] ?? { label: e.type.toUpperCase(), emoji: '·', color: '#8a93a4' };
@@ -76,6 +81,13 @@ export async function renderHighlights(env: Env, matchId: string, scope: string)
   .play.noplay { color: var(--muted); }
   .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
   .empty h2 { color: var(--text); font-size: 16px; margin: 0 0 8px; }
+  .stamp { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--border); padding: 10px 12px; }
+  .stamp-row { display: flex; gap: 6px; align-items: center; max-width: 720px; margin: 0 auto; flex-wrap: wrap; }
+  .stamp input[name=note] { flex: 1; min-width: 160px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; }
+  .stamp button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font: inherit; font-weight: 700; cursor: pointer; }
+  .stamp button.primary { background: var(--accent); color: #1a1a1a; border-color: var(--accent); }
+  .stamp button:disabled { opacity: 0.5; cursor: progress; }
+  .stamp .status { color: var(--muted); font-size: 12px; margin-left: 4px; }
   @media (max-width: 480px) {
     .card-inner { grid-template-columns: 1fr; gap: 6px; }
     .desc { order: 3; }
@@ -88,6 +100,49 @@ export async function renderHighlights(env: Env, matchId: string, scope: string)
   <h1>Highlights${scopeLabel ? ' · ' + escapeHtml(scopeLabel) : ''}</h1>
   <p>Match <code>${escapeHtml(safeId)}</code> · ${events.length} clip${events.length === 1 ? '' : 's'}${youtube ? '' : ' · <strong>set a YouTube URL in admin to enable replay links</strong>'}</p>
 </header>
+${admin ? `<section class="stamp" aria-label="Manual stamp">
+  <form id="stamp-form" class="stamp-row" autocomplete="off">
+    <input name="note" placeholder="Optional note (e.g. ‘big appeal’)" maxlength="200" />
+    <button type="submit" class="primary" data-type="moment">⭐ Stamp now</button>
+    <button type="button" data-type="4">4</button>
+    <button type="button" data-type="6">6</button>
+    <button type="button" data-type="wicket">W</button>
+    <span class="status" id="stamp-status"></span>
+  </form>
+</section>
+<script>
+(function(){
+  var STAMP_URL = ${JSON.stringify(stampPath)} + '?key=' + encodeURIComponent(${JSON.stringify(adminKey)});
+  var form = document.getElementById('stamp-form');
+  var noteInput = form.querySelector('input[name=note]');
+  var status = document.getElementById('stamp-status');
+  var buttons = form.querySelectorAll('button');
+  function setBusy(b){ buttons.forEach(function(btn){ btn.disabled = b; }); }
+  function send(type){
+    setBusy(true);
+    status.textContent = 'Stamping…';
+    fetch(STAMP_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: type, note: noteInput.value || '' }),
+    }).then(function(r){
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    }).then(function(){
+      noteInput.value = '';
+      status.textContent = 'Stamped — reloading…';
+      window.location.reload();
+    }).catch(function(e){
+      status.textContent = 'Failed: ' + e.message;
+      setBusy(false);
+    });
+  }
+  form.addEventListener('submit', function(e){ e.preventDefault(); send('moment'); });
+  Array.prototype.forEach.call(form.querySelectorAll('button[type=button]'), function(btn){
+    btn.addEventListener('click', function(){ send(btn.getAttribute('data-type') || 'moment'); });
+  });
+})();
+</script>` : ''}
 <main>
 ${cards || '<div class="empty"><h2>No highlights yet</h2><p>Wickets, 4s, 6s, and milestones will appear here as they happen.</p></div>'}
 </main>
@@ -97,6 +152,10 @@ ${cards || '<div class="empty"><h2>No highlights yet</h2><p>Wickets, 4s, 6s, and
 
 function describe(e: MatchEvent): string {
   const who = e.batter ? e.batter : '';
+  if (e.manual && e.note) {
+    // Manual stamps lead with the scorer's own caption regardless of type.
+    return e.note;
+  }
   switch (e.type) {
     case 'wicket': return `${who || 'Batter'} dismissed${e.context ? ' — ' + e.context : ''}${e.bowler ? ' (b ' + e.bowler + ')' : ''}`;
     case '4': return `${who || 'Batter'} laces a four${e.bowler ? ' off ' + e.bowler : ''}`;
@@ -104,6 +163,7 @@ function describe(e: MatchEvent): string {
     case 'fifty': return `${who || 'Batter'} brings up fifty${e.runs ? ' (' + e.runs + '*)' : ''}`;
     case 'hundred': return `${who || 'Batter'} brings up a HUNDRED${e.runs ? ' (' + e.runs + '*)' : ''}`;
     case 'team-milestone': return `Team passes ${e.runs}`;
+    case 'moment': return e.note ? e.note : 'Stamped moment';
   }
 }
 

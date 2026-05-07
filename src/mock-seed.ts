@@ -9,6 +9,9 @@
 //   tag:{matchId}:…         — wagon-wheel ball tags (zone + shot)
 //   vibe:{matchId}:…        — emoji reaction counters
 //   score:{matchId}:last_good — final-state score so /summary hero renders
+//   final-state:{matchId}:1   — sealed end-of-innings-1 snapshot for the
+//                               D1 archive's `innings` table
+//   final-state:{matchId}:2   — sealed end-of-innings-2 snapshot ditto
 //
 // Deliberately deterministic-ish — same matchId reseeds the same shape
 // (cleared first), so demos are stable.
@@ -59,8 +62,8 @@ export async function seedMockMatch(env: Env, matchId: string, scope: string): P
 
   // ---- Build event list ------------------------------------------------
   const events: MatchEvent[] = [];
-  const battingTeam = 'Home XI';
-  const bowlingTeam = 'Visiting XI';
+  const battingTeam = 'Home CC 3rd XI';
+  const bowlingTeam = 'Away CC 4th XI';
   const innings = 1;
 
   // Innings 1 narrative: 38.5 overs, 326/9 — top order tons, a few wickets,
@@ -92,6 +95,12 @@ export async function seedMockMatch(env: Env, matchId: string, scope: string): P
   events.push({ ts: startedAt + 18 * 60 * 1000, type: 'team-milestone', over: '8.2',  innings, runs: 100 });
   events.push({ ts: startedAt + 50 * 60 * 1000, type: 'team-milestone', over: '21.0', innings, runs: 200 });
   events.push({ ts: startedAt + 78 * 60 * 1000, type: 'team-milestone', over: '33.4', innings, runs: 300 });
+
+  // Two manual `moment` stamps so the new highlights "stamp" UI and the
+  // bounded-clip iframe (with explicit endTs) light up under mock data.
+  const momentTs1 = startedAt + 40 * 60 * 1000;
+  events.push({ ts: momentTs1, type: 'moment', over: '17.3', innings, manual: true, note: 'Big appeal turned down — replay it', endTs: momentTs1 + 18_000 });
+  events.push({ ts: startedAt + 65 * 60 * 1000, type: 'moment', over: '28.2', innings, manual: true });
 
   events.sort((a, b) => a.ts - b.ts);
 
@@ -159,12 +168,37 @@ export async function seedMockMatch(env: Env, matchId: string, scope: string): P
     source: 'mock',
   };
 
+  // ---- Per-innings final-state snapshots ------------------------------
+  // The D1 archive's `innings` table is fed from these `final-state:` keys.
+  // Innings 1 final state mirrors the seeded `score`. Innings 2 is a
+  // synthetic chase that finished, so the mock match exercises the
+  // multiple-innings code path end-to-end (single innings would let the
+  // bug — losing innings 1 — sneak back in unnoticed).
+  const inningsOneFinal: Score = { ...score, innings: 1 };
+  const inningsTwoFinal: Score = {
+    matchId,
+    fetchedAt: new Date().toISOString(),
+    status: 'finished',
+    innings: 2,
+    battingTeam: bowlingTeam,
+    bowlingTeam: battingTeam,
+    runs: 248,
+    wickets: 10,
+    overs: '36.2',
+    oversTotal: 40,
+    target: 327,
+    source: 'mock',
+  };
+
   // ---- Persist all writes in parallel ----------------------------------
   const eventsRaw = JSON.stringify(events);
   await Promise.all([
     env.CRICKET_CACHE.put(`events:${matchId}`, eventsRaw),
     env.CRICKET_CACHE.put(`score:${matchId}`, JSON.stringify(score)),
     env.CRICKET_CACHE.put(`score:${matchId}:last_good`, JSON.stringify(score)),
+    env.CRICKET_CACHE.put(`final-state:${matchId}:1`, JSON.stringify(inningsOneFinal)),
+    env.CRICKET_CACHE.put(`final-state:${matchId}:2`, JSON.stringify(inningsTwoFinal)),
+    env.CRICKET_CACHE.put(`score:${matchId}:last_innings`, '2'),
     ...tagWrites,
     ...vibeWrites,
   ]);
@@ -182,7 +216,7 @@ export async function seedMockMatch(env: Env, matchId: string, scope: string): P
 /** Wipe every key for this matchId across all v2 stores. */
 async function clearMatchKeys(env: Env, matchId: string): Promise<number> {
   let cleared = 0;
-  for (const prefix of [`tag:${matchId}:`, `vibe:${matchId}:`, `vote:${matchId}:`]) {
+  for (const prefix of [`tag:${matchId}:`, `vibe:${matchId}:`, `vote:${matchId}:`, `final-state:${matchId}:`]) {
     const list = await env.CRICKET_CACHE.list({ prefix });
     await Promise.all(list.keys.map((k) => env.CRICKET_CACHE.delete(k.name)));
     cleared += list.keys.length;
@@ -193,6 +227,7 @@ async function clearMatchKeys(env: Env, matchId: string): Promise<number> {
     env.CRICKET_CACHE.delete(`tag-meta:${matchId}`),
     env.CRICKET_CACHE.delete(`score:${matchId}`),
     env.CRICKET_CACHE.delete(`score:${matchId}:last_good`),
+    env.CRICKET_CACHE.delete(`score:${matchId}:last_innings`),
   ]);
   return cleared;
 }

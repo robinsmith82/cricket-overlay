@@ -15,7 +15,6 @@ import type { Env, Score } from './types';
  * the storage-tier ordering. The id column is AUTOINCREMENT — no PK clashes.
  */
 export async function logScrape(env: Env, score: Score): Promise<void> {
-  if (!env.LOG_DB) return; // optional D1 binding — no-op when unconfigured
   try {
     await env.LOG_DB
       .prepare(

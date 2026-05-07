@@ -4,6 +4,12 @@ export type YouTubeConfig = {
   url: string;
   videoId: string;
   startedAt: number;
+  // Where `startedAt` came from. 'youtube' = liveStreamingDetails.actualStartTime
+  // (authoritative); 'fallback' = wall-clock at the moment admin saved the URL,
+  // used only when YouTube can't (or won't) tell us yet (video not live, no API
+  // key configured, transient API error). Older configs without this field are
+  // treated as 'fallback' on read.
+  startSource?: 'youtube' | 'fallback';
 };
 
 export type ShotType =
@@ -71,6 +77,35 @@ export async function readYouTube(env: Env, scope = ''): Promise<YouTubeConfig |
   }
 }
 
+/**
+ * Ask the YouTube Data API for the broadcast's actualStartTime.
+ *
+ * Returns ms-since-epoch when YouTube confirms the broadcast has gone live,
+ * `null` for everything else (video unscheduled, scheduled-but-not-yet-live,
+ * not a livestream, deleted, no API key configured, transient HTTP error).
+ * Callers that need a deterministic value should fall back to Date.now().
+ *
+ * Free quota is 10k units/day; this call costs 1 unit, so a club season is
+ * effectively unbounded.
+ */
+export async function fetchYouTubeStartTime(videoId: string, apiKey: string | undefined): Promise<number | null> {
+  if (!apiKey || !videoId) return null;
+  try {
+    const u = `https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${encodeURIComponent(videoId)}&key=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(u, { cf: { cacheTtl: 0 } } as RequestInit);
+    if (!res.ok) return null;
+    const data = await res.json() as {
+      items?: Array<{ liveStreamingDetails?: { actualStartTime?: string } }>;
+    };
+    const iso = data.items?.[0]?.liveStreamingDetails?.actualStartTime;
+    if (!iso) return null;
+    const ms = Date.parse(iso);
+    return Number.isFinite(ms) ? ms : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function writeYouTube(env: Env, url: string, scope = ''): Promise<YouTubeConfig | null> {
   const trimmed = url.trim();
   if (!trimmed) {
@@ -79,9 +114,34 @@ export async function writeYouTube(env: Env, url: string, scope = ''): Promise<Y
   }
   const videoId = extractYouTubeVideoId(trimmed);
   if (!videoId) return null;
-  const config: YouTubeConfig = { url: trimmed, videoId, startedAt: Date.now() };
+  // Try YouTube first so the offset baseline matches when the broadcast
+  // actually went live, regardless of when admin pasted the URL.
+  const ytStart = await fetchYouTubeStartTime(videoId, env.YOUTUBE_API_KEY);
+  const config: YouTubeConfig = ytStart !== null
+    ? { url: trimmed, videoId, startedAt: ytStart, startSource: 'youtube' }
+    : { url: trimmed, videoId, startedAt: Date.now(), startSource: 'fallback' };
   await env.CRICKET_CACHE.put(youtubeKey(scope), JSON.stringify(config));
   return config;
+}
+
+/**
+ * Re-query YouTube for actualStartTime and overwrite startedAt if found. Used
+ * by the admin "Refresh start time" action when the URL was pasted before the
+ * broadcast went live (so the original write fell back to Date.now()).
+ *
+ * No-op + returns the existing config when YouTube still has no actualStartTime
+ * (or the API key isn't configured); the caller is expected to surface that
+ * outcome in the admin UI rather than silently overwrite a good 'youtube'
+ * value with a fresh fallback.
+ */
+export async function refreshYouTubeStartTime(env: Env, scope = ''): Promise<YouTubeConfig | null> {
+  const existing = await readYouTube(env, scope);
+  if (!existing) return null;
+  const ytStart = await fetchYouTubeStartTime(existing.videoId, env.YOUTUBE_API_KEY);
+  if (ytStart === null) return existing;
+  const updated: YouTubeConfig = { ...existing, startedAt: ytStart, startSource: 'youtube' };
+  await env.CRICKET_CACHE.put(youtubeKey(scope), JSON.stringify(updated));
+  return updated;
 }
 
 // ---------- Ball tagging --------------------------------------------------

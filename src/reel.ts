@@ -22,6 +22,7 @@ const TYPE_BASE_WEIGHT: Record<MatchEvent['type'], number> = {
   fifty: 5,
   '6': 4,
   '4': 2,
+  moment: 3,
   'team-milestone': 1,
 };
 
@@ -32,6 +33,7 @@ const TYPE_LABEL: Record<MatchEvent['type'], string> = {
   fifty: 'FIFTY',
   hundred: 'HUNDRED',
   'team-milestone': 'MILESTONE',
+  moment: 'MOMENT',
 };
 
 const TYPE_COLOR: Record<MatchEvent['type'], string> = {
@@ -41,6 +43,7 @@ const TYPE_COLOR: Record<MatchEvent['type'], string> = {
   fifty: '#ffd23a',
   hundred: '#ffd23a',
   'team-milestone': '#3ddc84',
+  moment: '#c9b46c',
 };
 
 type RankedEvent = {

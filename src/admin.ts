@@ -1,15 +1,17 @@
 import type { Env } from './types';
-import {
-  readBranding,
-  writeSponsors,
-  writeTeams,
-  writeBrandingMeta,
-  type Sponsor,
-  type TeamBrand,
-} from './branding';
-import { discoverFixtures, type DiscoveredMatch } from './discovery';
-import { readYouTube, writeYouTube, type YouTubeConfig } from './archive';
+import { readBranding, writeSponsors, writeTeams, type Sponsor, type TeamBrand } from './branding';
+import { discoverMatches, type DiscoveredMatch } from './discovery';
+import { readYouTube, writeYouTube, refreshYouTubeStartTime, type YouTubeConfig } from './archive';
 import { seedMockMatch } from './mock-seed';
+import { renderDiagnose } from './diagnose';
+import { listArchivedMatches, isArchived, type ArchivedMatch } from './match-archive';
+import { getHeadToHead, type H2HResult } from './head-to-head';
+import { renderSetup } from './setup';
+
+/** H2H lookup per discovered fixture, keyed by matchId. Empty/missing means
+ *  the lookup either failed or returned no prior meetings — render the
+ *  explicit-empty state. */
+type H2HByMatchId = Record<string, H2HResult>;
 
 function activeKey(scope: string): string {
   return scope ? `active_match_id:${scope}` : 'active_match_id';
@@ -39,11 +41,49 @@ function isAuthed(env: Env, url: URL, scope: string): boolean {
   return url.searchParams.get('key') === expected;
 }
 
+/**
+ * Public admin-auth check for routes outside `handleAdmin`. Mirrors the
+ * `?key=…` pattern used by every other admin surface — no cookies, no
+ * sessions; the URL key is the only credential.
+ */
+export function isAdmin(env: Env, url: URL, scope = ''): boolean {
+  return isAuthed(env, url, scope);
+}
+
 export async function handleAdmin(request: Request, env: Env, url: URL, scope = ''): Promise<Response> {
   if (!isAuthed(env, url, scope)) return unauth();
 
+  // Game-day setup wizard. Lives at /[scope]/admin/setup. Each step is GET
+  // with `?step=N`; form submits go to existing /[scope]/admin/<action>
+  // handlers (set-active, youtube, youtube-refresh) with a `next` field so
+  // the redirect lands back in the wizard instead of /admin.
+  if (url.pathname.endsWith('/setup') || url.pathname.endsWith('/setup/')) {
+    return new Response(await renderSetup(env, scope, url, url.origin), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    });
+  }
+
   if (url.pathname.endsWith('/logs') || url.pathname.endsWith('/logs/')) {
     return renderLogsPage(env, url, scope);
+  }
+
+  if (url.pathname.endsWith('/archive') || url.pathname.endsWith('/archive/')) {
+    return renderArchivePage(env, url, scope);
+  }
+
+  // /admin/diagnose[/:matchId] — match-level health check page.
+  // Defaults to the scope's active match if no id is given.
+  const diagPathMatch = url.pathname.match(/\/admin\/diagnose(?:\/([^/]+))?\/?$/);
+  if (diagPathMatch) {
+    const matchId = diagPathMatch[1]
+      ? decodeURIComponent(diagPathMatch[1])
+      : ((await getActiveMatchId(env, scope)) ?? '');
+    if (!matchId) {
+      return new Response('No active match for this scope and no matchId in URL.', { status: 400 });
+    }
+    return new Response(await renderDiagnose(env, matchId, scope), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    });
   }
 
   if (request.method === 'POST') {
@@ -53,12 +93,26 @@ export async function handleAdmin(request: Request, env: Env, url: URL, scope = 
   const [branding, active, fixtures, youtube] = await Promise.all([
     readBranding(env, scope),
     getActiveMatchId(env, scope),
-    discoverFixtures(env).catch(() => [] as DiscoveredMatch[]),
+    discoverMatches(env).catch(() => [] as DiscoveredMatch[]),
     readYouTube(env, scope),
   ]);
+  // Per-fixture head-to-head against the D1 archive. Looked up in parallel,
+  // each individually try-caught — a single bad lookup must not break the
+  // discovery list. Fixtures missing one of the team names are skipped.
+  const h2h: H2HByMatchId = {};
+  await Promise.all(
+    fixtures.map(async (f) => {
+      if (!f.battingTeam || !f.bowlingTeam) return;
+      try {
+        h2h[f.matchId] = await getHeadToHead(env, f.battingTeam, f.bowlingTeam);
+      } catch {
+        // Swallow — explicit-empty render is the fallback.
+      }
+    }),
+  );
   const key = adminKeyFor(env, scope) ?? '';
   return new Response(
-    renderAdmin(active, branding.sponsors, branding.teams, key, scope, env, fixtures, youtube, branding),
+    renderAdmin(active, branding.sponsors, branding.teams, key, scope, env, fixtures, youtube, h2h),
     { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } },
   );
 }
@@ -75,16 +129,11 @@ async function handleAdminPost(request: Request, env: Env, url: URL, scope: stri
   } else if (action === 'teams') {
     const json = String(form.get('json') ?? '{}');
     try { await writeTeams(env, JSON.parse(json) as Record<string, TeamBrand>, scope); } catch { /* ignore parse */ }
-  } else if (action === 'meta') {
-    const footerText = String(form.get('footerText') ?? '').trim();
-    const headerLogoUrl = String(form.get('headerLogoUrl') ?? '').trim();
-    await writeBrandingMeta(env, {
-      footerText: footerText || undefined,
-      headerLogoUrl: headerLogoUrl || undefined,
-    }, scope);
   } else if (action === 'youtube') {
     const url = String(form.get('url') ?? '');
     await writeYouTube(env, url, scope);
+  } else if (action === 'youtube-refresh') {
+    await refreshYouTubeStartTime(env, scope);
   } else if (action === 'mock-seed') {
     // Seed a fake match with synthetic events / tags / vibes so the v2
     // surfaces all populate without needing a live game. Default matchId
@@ -98,6 +147,15 @@ async function handleAdminPost(request: Request, env: Env, url: URL, scope: stri
   }
   const adminPath = scope ? `/${scope}/admin` : '/admin';
   const key = adminKeyFor(env, scope) ?? '';
+  // Wizard steps post here with a `next` field that routes the redirect into
+  // the next wizard step instead of dumping the user back at /admin. We only
+  // honour same-origin paths under this scope's /admin/setup, so a hostile
+  // value can't turn this into an open redirect.
+  const next = String(form.get('next') ?? '').trim();
+  const setupPrefix = `${adminPath}/setup`;
+  if (next.startsWith('/') && (next === setupPrefix || next.startsWith(`${setupPrefix}?`) || next.startsWith(`${setupPrefix}/`))) {
+    return Response.redirect(`${url.origin}${next}`, 303);
+  }
   return Response.redirect(`${url.origin}${adminPath}?key=${encodeURIComponent(key)}`, 303);
 }
 
@@ -110,7 +168,7 @@ function renderAdmin(
   env: Env,
   fixtures: DiscoveredMatch[],
   youtube: YouTubeConfig | null,
-  branding: { footerText?: string; headerLogoUrl?: string },
+  h2h: H2HByMatchId,
 ): string {
   const sponsorsJson = JSON.stringify(sponsors, null, 2);
   const teamsJson = JSON.stringify(teams, null, 2);
@@ -208,6 +266,29 @@ function renderAdmin(
     flex-shrink: 0;
   }
   .fixture.active button { background: #2a2e36; color: var(--muted); cursor: default; }
+  .fix-wrap { display: flex; flex-direction: column; gap: 6px; }
+  .h2h {
+    margin: 0 0 0 14px;
+    padding: 8px 12px;
+    background: #0a0d12;
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    border-radius: 0 4px 4px 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .h2h.empty { border-left-color: #2a2e36; }
+  .h2h-head { color: var(--text); font-weight: 600; }
+  .h2h-tally { color: var(--accent); font-weight: 700; letter-spacing: 0.04em; }
+  .h2h-list { margin: 6px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+  .h2h-list li { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .h2h-list a { color: var(--text); text-decoration: none; }
+  .h2h-list a:hover { color: var(--accent); text-decoration: underline; }
+  .h2h-list .verdict { color: var(--muted); margin-left: 6px; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .h2h-list .verdict.win { color: #3ddc84; }
+  .h2h-list .verdict.loss { color: #ff8a8a; }
+  .h2h-list .verdict.draw { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -215,7 +296,9 @@ function renderAdmin(
   <h1>Cricket overlay admin · <span class="scope">${escapeHtml(scopeLabel)}</span></h1>
   <span class="live"><span class="dot"></span>active match: <code>${escapeHtml(active ?? '— none —')}</code></span>
   <nav>
+    <a href="${adminPath}/setup?key=${encodeURIComponent(key)}" style="background:var(--accent);color:#0a0d12;border-color:var(--accent);font-weight:700">▶ Setup wizard</a>
     <a href="${adminPath}/logs?key=${encodeURIComponent(key)}">Logs</a>
+    <a href="${adminPath}/archive?key=${encodeURIComponent(key)}">Archive</a>
     ${otherScopes
       .map((s) => {
         const label = s ? s.toUpperCase() : 'DEFAULT';
@@ -234,19 +317,22 @@ function renderAdmin(
         ${fixtures
           .map(
             (f) => `
-          <form method="POST" action="${adminPath}/set-active?key=${encodeURIComponent(key)}" class="fixture ${f.matchId === active ? 'active' : ''}">
-            <input type="hidden" name="matchId" value="${escapeHtml(f.matchId)}" />
-            <div class="fix-meta">
-              <div class="fix-teams">${escapeHtml(f.battingTeam)} <span class="vs">vs</span> ${escapeHtml(f.bowlingTeam)}</div>
-              <div class="fix-sub"><code>${escapeHtml(f.matchId)}</code> · ${escapeHtml(f.status)}${f.matchId === active ? ' · <strong>active</strong>' : ''}</div>
-            </div>
-            <button type="submit">Set active</button>
-          </form>`,
+          <div class="fix-wrap">
+            <form method="POST" action="${adminPath}/set-active?key=${encodeURIComponent(key)}" class="fixture ${f.matchId === active ? 'active' : ''}">
+              <input type="hidden" name="matchId" value="${escapeHtml(f.matchId)}" />
+              <div class="fix-meta">
+                <div class="fix-teams">${escapeHtml(f.battingTeam)} <span class="vs">vs</span> ${escapeHtml(f.bowlingTeam)}</div>
+                <div class="fix-sub"><code>${escapeHtml(f.matchId)}</code> · ${escapeHtml(f.status)}${f.matchId === active ? ' · <strong>active</strong>' : ''}</div>
+              </div>
+              <button type="submit">Set active</button>
+            </form>
+            ${renderH2H(f, h2h[f.matchId], scope)}
+          </div>`,
           )
           .join('')}
       </div>
-      <p class="meta">Auto-discovered from the configured <code>DISCOVERY_HOME_URL</code>. Refreshes every 5 minutes; if you don't see what you expect, it'll catch up shortly.</p>`
-        : `<p class="meta"><em>No discovered fixtures right now${env.DISCOVERY_HOME_URL ? " — the home page didn't return any match IDs" : ' — set the <code>DISCOVERY_HOME_URL</code> Worker var to enable fixture auto-discovery'}.</em></p>`
+      <p class="meta">Auto-discovered from the configured Play-Cricket home page (set <code>DISCOVERY_HOME_URL</code> in <code>wrangler.toml</code>). Refreshes every 5 minutes; if you don't see what you expect, it'll catch up shortly.</p>`
+        : `<p class="meta"><em>No discovered fixtures right now — either set <code>DISCOVERY_HOME_URL</code> in <code>wrangler.toml</code>, or paste a match ID manually below.</em></p>`
     }
     <p class="meta">Or paste a match ID manually:</p>
     <form method="POST" action="${adminPath}/set-active?key=${encodeURIComponent(key)}">
@@ -256,8 +342,7 @@ function renderAdmin(
       </div>
     </form>
     <label>OBS URL (copy this once):</label>
-    <input type="text" readonly value="${overlayActiveUrl}" />
-    <p class="meta">Prefix with <code>https://&lt;your-worker&gt;.workers.dev</code> when pasting into OBS Browser Source.</p>
+    <input type="text" readonly value="${overlayActiveUrl}" placeholder="https://&lt;your-worker&gt;.workers.dev${overlayActiveUrl}" />
   </section>
 
   <section>
@@ -280,7 +365,14 @@ function renderAdmin(
     </form>
     ${
       youtube
-        ? `<p class="meta" style="margin-top:14px">Active: <code>${escapeHtml(youtube.videoId)}</code> · started ${escapeHtml(formatRelative(youtube.startedAt))} ago</p>`
+        ? `<p class="meta" style="margin-top:14px">Active: <code>${escapeHtml(youtube.videoId)}</code> · started ${escapeHtml(formatRelative(youtube.startedAt))} ago${
+            youtube.startSource === 'youtube'
+              ? ' <span style="color:#3ddc84">(from YouTube)</span>'
+              : ' <span style="color:#ffd23a">(fallback — pasted-at time; click refresh once the broadcast is live)</span>'
+          }</p>
+          <form method="POST" action="${adminPath}/youtube-refresh?key=${encodeURIComponent(key)}" style="margin-top:8px">
+            <button type="submit">Refresh start time from YouTube</button>
+          </form>`
         : `<p class="meta" style="margin-top:14px"><em>No stream URL set — highlights/summary won't have replay links.</em></p>`
     }
   </section>
@@ -301,18 +393,6 @@ function renderAdmin(
     </p>
   </section>
 
-  <section>
-    <h2>Branding meta — ${escapeHtml(scopeLabel)}</h2>
-    <p class="meta">Optional header logo (rendered top-left of the overlay) and footer text (rendered on share cards / summary page).</p>
-    <form method="POST" action="${adminPath}/meta?key=${encodeURIComponent(key)}">
-      <label>Header logo URL</label>
-      <input type="text" name="headerLogoUrl" placeholder="https://..." value="${escapeHtml(branding.headerLogoUrl ?? '')}" />
-      <label>Footer text</label>
-      <input type="text" name="footerText" placeholder="e.g. yourclub.example.com" value="${escapeHtml(branding.footerText ?? '')}" />
-      <button type="submit">Save branding meta</button>
-    </form>
-  </section>
-
   <section class="full">
     <h2>Sponsors — ${escapeHtml(scopeLabel)}</h2>
     <p class="meta">JSON array. Each entry: <code>{ "name": "...", "imageUrl": "...", "text": "...", "durationMs": 12000 }</code>. Rotates every <code>durationMs</code> (default 12s).</p>
@@ -324,7 +404,7 @@ function renderAdmin(
 
   <section class="full">
     <h2>Team branding — ${escapeHtml(scopeLabel)}</h2>
-    <p class="meta">JSON object keyed by case-insensitive substring of the team name. Each value: <code>{ "primary": "#ffd23a", "secondary": "#000", "crestUrl": "https://..." }</code>. Substring match means <code>"acme"</code> would match "Acme CC 1st XI" and "Acme Wanderers".</p>
+    <p class="meta">JSON object keyed by case-insensitive substring of the team name. Each value: <code>{ "primary": "#ffd23a", "secondary": "#000", "crestUrl": "https://..." }</code>. Substring match means <code>"shire"</code> matches "Shire CC, 1st XI" — pick a key that's distinctive to one team.</p>
     <form method="POST" action="${adminPath}/teams?key=${encodeURIComponent(key)}">
       <textarea name="json">${escapeHtml(teamsJson)}</textarea>
       <button type="submit">Save team branding</button>
@@ -337,6 +417,92 @@ function renderAdmin(
 
 function escapeHtml(s: string): string {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+}
+
+/**
+ * Render the head-to-head card for a discovered fixture. The card is
+ * deliberately compact — it slots in under each fixture row and shows the
+ * tally plus the most recent meetings, each linking to its summary page.
+ *
+ * Three render states:
+ *   - lookup failed / never ran (h2h undefined) → render the empty-state line
+ *     ("first archived meeting") so the operator knows we didn't silently
+ *     skip the lookup.
+ *   - played === 0 → same explicit-empty state.
+ *   - played > 0  → tally + list.
+ *
+ * `f.battingTeam` is the perspective we count wins from (the "A" side passed
+ * to getHeadToHead). Verdicts are rendered relative to that team.
+ */
+function renderH2H(f: DiscoveredMatch, result: H2HResult | undefined, scope: string): string {
+  const oppo = f.bowlingTeam || 'opposition';
+  if (!result || result.summary.played === 0) {
+    return `<div class="h2h empty">vs <span class="h2h-head">${escapeHtml(oppo)}</span> · <em>first archived meeting (no prior results in archive)</em></div>`;
+  }
+
+  const { played, aWins, bWins, draws, unknown } = result.summary;
+  const tally = `${aWins}W / ${bWins}L / ${draws}D${unknown ? ` / ${unknown}?` : ''}`;
+  const matchPrefix = scope ? `/${scope}` : '';
+
+  const items = result.prior
+    .map((m) => {
+      // Score line: "Home 145/8 · Away 142/10". Falls back gracefully if
+      // innings rows are missing.
+      const scoreLine = m.innings.length
+        ? m.innings
+            .map((i) => {
+              const team = i.battingTeam ?? '?';
+              const runs = i.runs ?? 0;
+              const wkts = i.wickets ?? 0;
+              return `${escapeHtml(team)} ${runs}/${wkts}`;
+            })
+            .join(' · ')
+        : (m.status ? `<em>${escapeHtml(m.status)}</em>` : '<em>no innings recorded</em>');
+
+      // Verdict relative to the fixture's batting team (the "A" side).
+      const verdict = verdictLabel(m, f.battingTeam, f.bowlingTeam);
+
+      const date = new Date(m.archivedAt);
+      const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+
+      return `<li><a href="${matchPrefix}/summary/${encodeURIComponent(m.matchId)}">${dateStr} · ${scoreLine}</a>${verdict}</li>`;
+    })
+    .join('');
+
+  return `<div class="h2h">
+    <div>vs <span class="h2h-head">${escapeHtml(oppo)}</span> · <span class="h2h-tally">${played} archived meeting${played === 1 ? '' : 's'} (${tally})</span></div>
+    <ul class="h2h-list">${items}</ul>
+  </div>`;
+}
+
+/**
+ * Compute the verdict pill for a single archived meeting, from the
+ * perspective of `aTeam` (the fixture's batting team / "A" side). Mirrors
+ * the attribution logic in head-to-head.ts but stays decoupled — the H2H
+ * module returns aggregate counts only, not per-match verdicts, so we
+ * recompute here for display.
+ */
+function verdictLabel(m: { status: string | null; innings: { battingTeam: string | null; runs: number | null }[] }, aTeam: string, bTeam: string): string {
+  const aN = aTeam.trim().toLowerCase();
+  const bN = bTeam.trim().toLowerCase();
+  const status = (m.status ?? '').trim().toLowerCase();
+  if (status === 'drawn') return ' <span class="verdict draw">drew</span>';
+  if (status !== 'finished') return ' <span class="verdict">result unknown</span>';
+
+  let aRuns = 0;
+  let bRuns = 0;
+  let aSeen = false;
+  let bSeen = false;
+  for (const i of m.innings) {
+    const bt = (i.battingTeam ?? '').trim().toLowerCase();
+    const r = i.runs ?? 0;
+    if (bt === aN) { aRuns += r; aSeen = true; }
+    else if (bt === bN) { bRuns += r; bSeen = true; }
+  }
+  if (!aSeen || !bSeen) return ' <span class="verdict">result unknown</span>';
+  if (aRuns > bRuns) return ' <span class="verdict win">won</span>';
+  if (bRuns > aRuns) return ' <span class="verdict loss">lost</span>';
+  return ' <span class="verdict draw">tied</span>';
 }
 
 function formatRelative(ts: number): string {
@@ -374,12 +540,9 @@ async function renderLogsPage(env: Env, url: URL, scope: string): Promise<Respon
 
   let rows: LogRow[] = [];
   let queryError: string | null = null;
-  if (!env.LOG_DB) {
-    queryError = 'LOG_DB binding not configured. See wrangler.toml and migrations/0001_scrape_log.sql.';
-  } else try {
-    const db = env.LOG_DB;
+  try {
     const stmt = filterMatchId
-      ? db
+      ? env.LOG_DB
           .prepare(
             `SELECT ts, match_id, source, ok, status, runs, wickets, overs, batting_team, changed, error
              FROM scrape_log
@@ -387,7 +550,7 @@ async function renderLogsPage(env: Env, url: URL, scope: string): Promise<Respon
              ORDER BY id DESC LIMIT 500`,
           )
           .bind(filterMatchId)
-      : db.prepare(
+      : env.LOG_DB.prepare(
           `SELECT ts, match_id, source, ok, status, runs, wickets, overs, batting_team, changed, error
            FROM scrape_log
            ${onlyChanges ? 'WHERE changed = 1' : ''}
@@ -477,6 +640,127 @@ ${
           <td class="muted">${escapeHtml(r.batting_team ?? '')}</td>
           <td class="${r.changed === 1 ? 'change-cell' : 'muted'}">${r.changed === 1 ? '●' : '·'}</td>
           <td class="err-cell">${escapeHtml(r.error ?? '')}</td>
+        </tr>`;
+      })
+      .join('')}
+  </tbody>
+</table>
+</div>`
+}
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
+}
+
+// ---------- Match archive viewer -------------------------------------------
+
+async function renderArchivePage(env: Env, _url: URL, scope: string): Promise<Response> {
+  const key = adminKeyFor(env, scope) ?? '';
+  const adminPath = scope ? `/${scope}/admin` : '/admin';
+  const scopeLabel = scope ? scope.toUpperCase() : 'DEFAULT';
+
+  let rows: ArchivedMatch[] = [];
+  let queryError: string | null = null;
+  try {
+    rows = await listArchivedMatches(env, 50);
+  } catch (e) {
+    queryError = e instanceof Error ? e.message : String(e);
+  }
+
+  const active = await getActiveMatchId(env, scope);
+  const activeArchived = active ? await isArchived(env, active) : false;
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Match archive · ${escapeHtml(scopeLabel)}</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161a22; --border:#232a35; --accent:#ffd23a; --text:#e8eaed; --muted:#8a93a4; --ok:#3ddc84; --err:#ff5d5d; }
+  body { margin:0; font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 20px 32px; border-bottom: 1px solid var(--border); display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size: 16px; letter-spacing: 0.05em; text-transform: uppercase; }
+  header .scope { color: var(--accent); font-weight: 800; letter-spacing: 0.18em; }
+  header nav { margin-left:auto; display:flex; gap:8px; }
+  header nav a { color: var(--muted); text-decoration:none; padding: 6px 12px; border:1px solid var(--border); border-radius:4px; font-size:12px; letter-spacing: 0.1em; text-transform: uppercase; }
+  header nav a:hover { color: var(--accent); border-color: var(--accent); }
+  .panel { margin: 18px 32px; padding: 16px 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .panel h2 { margin: 0 0 10px; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+  .panel p { margin: 0; color: var(--muted); }
+  .panel form { display: inline; }
+  .panel button { padding: 8px 16px; background: var(--accent); color: #0a0d12; border: none; border-radius: 4px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; cursor: pointer; font-size: 11px; }
+  .panel button:hover { background: #ffe066; }
+  .panel button[disabled] { background: #2a2e36; color: var(--muted); cursor: default; }
+  .scroll { max-height: calc(100vh - 240px); overflow-y: auto; margin: 0 32px; }
+  table { width:100%; border-collapse: collapse; }
+  thead { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  tr:hover td { background: rgba(255, 210, 58, 0.04); }
+  td.muted { color: var(--muted); }
+  td a { color: var(--accent); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  .empty, .qerr { padding: 40px 32px; color: var(--muted); text-align: center; }
+  .qerr { color: var(--err); font-family: ui-monospace, Menlo, monospace; font-size: 12px; text-align: left; padding: 16px 32px; }
+  .qerr strong { display:block; margin-bottom: 6px; color: var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Match archive · <span class="scope">${escapeHtml(scopeLabel)}</span></h1>
+  <span style="color:var(--muted); font-size:12px;">${rows.length} archived match${rows.length === 1 ? '' : 'es'}</span>
+  <nav>
+    <a href="${adminPath}?key=${encodeURIComponent(key)}">← Back to admin</a>
+  </nav>
+</header>
+
+<div class="panel">
+  <h2>Archive active match — ${escapeHtml(scopeLabel)}</h2>
+  ${
+    active
+      ? activeArchived
+        ? `<p>Active match <code>${escapeHtml(active)}</code> is already archived. Re-archiving will overwrite (idempotent).</p>
+           <form method="POST" action="/api/admin/archive/${encodeURIComponent(active)}?key=${encodeURIComponent(key)}${scope ? '&scope=' + encodeURIComponent(scope) : ''}" style="margin-top:10px">
+             <button type="submit">Re-archive ${escapeHtml(active)}</button>
+           </form>`
+        : `<p>Active match: <code>${escapeHtml(active)}</code></p>
+           <form method="POST" action="/api/admin/archive/${encodeURIComponent(active)}?key=${encodeURIComponent(key)}${scope ? '&scope=' + encodeURIComponent(scope) : ''}" style="margin-top:10px">
+             <button type="submit">Archive now</button>
+           </form>`
+      : `<p><em>No active match for this scope. Set one on the admin page first.</em></p>`
+  }
+</div>
+
+${
+  queryError
+    ? `<div class="qerr"><strong>D1 query failed</strong>${escapeHtml(queryError)}<br><br>Have you applied migration 0002_match_archive.sql?</div>`
+    : rows.length === 0
+      ? `<div class="empty">No archived matches yet. Completed matches auto-archive once the scrape pipeline detects a terminal status.</div>`
+      : `<div class="scroll">
+<table>
+  <thead><tr>
+    <th>Archived</th><th>Match ID</th><th>Scope</th><th>Teams</th><th>Status</th><th>Events</th><th>Balls</th><th>Links</th>
+  </tr></thead>
+  <tbody>
+    ${rows
+      .map((r) => {
+        const teams = [r.home_team, r.away_team].filter(Boolean).join(' v ') || '—';
+        const matchPrefix = r.scope ? `/${r.scope}` : '';
+        return `<tr>
+          <td title="${new Date(r.archived_at).toISOString()}">${formatRelative(r.archived_at)} ago</td>
+          <td><code>${escapeHtml(r.match_id)}</code></td>
+          <td class="muted">${escapeHtml(r.scope || 'default')}</td>
+          <td>${escapeHtml(teams)}</td>
+          <td class="muted">${escapeHtml(r.status ?? '')}</td>
+          <td>${r.total_events}</td>
+          <td>${r.total_balls}</td>
+          <td>
+            <a href="/api/archive/${encodeURIComponent(r.match_id)}" target="_blank" rel="noopener">JSON</a>
+            · <a href="${matchPrefix}/summary/${encodeURIComponent(r.match_id)}" target="_blank" rel="noopener">summary</a>
+          </td>
         </tr>`;
       })
       .join('')}

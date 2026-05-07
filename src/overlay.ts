@@ -1,3 +1,4 @@
+import { BRAND_LOGO_DATA_URI, BRAND_MASCOT_DATA_URI } from './assets';
 import type { BrandingConfig } from './branding';
 
 const SCOPE_LABELS: Record<string, string> = {
@@ -42,6 +43,7 @@ export function renderOverlay(matchId: string, branding?: BrandingConfig, scope 
   }
   #brand .logos { display: flex; align-items: center; gap: 12px; }
   #brand img { height: 84px; width: auto; display: block; }
+  #brand img.brand-mascot { height: 96px; }
   #brand .scope-label {
     font-size: 14px;
     font-weight: 800;
@@ -477,7 +479,8 @@ export function renderOverlay(matchId: string, branding?: BrandingConfig, scope 
 <div id="flash"><div class="flash-headline"></div><div class="flash-sub"></div></div>
 <div id="brand">
   <div class="logos">
-    <img class="header-logo" alt="" hidden />
+    <img class="brand-logo" alt="" />
+    <img class="brand-mascot" alt="" />
   </div>
   ${scopeLabel ? `<div class="scope-label">${scopeLabel}</div>` : ''}
 </div>
@@ -538,12 +541,13 @@ export function renderOverlay(matchId: string, branding?: BrandingConfig, scope 
   (function(){
     var MATCH_ID = ${JSON.stringify(safeId)};
     var qs = window.location.search || '';
+    var BRAND_LOGO = ${JSON.stringify(BRAND_LOGO_DATA_URI)};
+    var BRAND_MASCOT = ${JSON.stringify(BRAND_MASCOT_DATA_URI)};
+    var brandLogoEl = document.querySelector('#brand .brand-logo');
+    var brandMascotEl = document.querySelector('#brand .brand-mascot');
+    if (BRAND_LOGO) brandLogoEl.src = BRAND_LOGO; else brandLogoEl.style.display = 'none';
+    if (BRAND_MASCOT) brandMascotEl.src = BRAND_MASCOT; else brandMascotEl.style.display = 'none';
     var BRANDING = ${brandingJson};
-    if (BRANDING && BRANDING.headerLogoUrl) {
-      var headerLogo = document.querySelector('#brand .header-logo');
-      headerLogo.src = BRANDING.headerLogoUrl;
-      headerLogo.removeAttribute('hidden');
-    }
     var wrap = document.getElementById('wrap');
     var players = document.getElementById('players');
     var bat1 = document.getElementById('bat1');

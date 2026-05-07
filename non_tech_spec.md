@@ -4,7 +4,7 @@ For a mate helping out who's comfortable with computers but doesn't write code.
 
 ## What we're trying to do
 
-Stream your club's 4th XI matches to YouTube, with a **proper TV-style scorebar** along the bottom showing the live score, like the BBC do for Test cricket. No hand-typing scores, no manual updates — the bar updates itself.
+Stream your-club & MyClub 4th XI matches to YouTube, with a **proper TV-style scorebar** along the bottom showing the live score, like the BBC do for Test cricket. No hand-typing scores, no manual updates — the bar updates itself.
 
 ```
    ┌──────────────────────────────────────────────────────────┐
@@ -14,7 +14,7 @@ Stream your club's 4th XI matches to YouTube, with a **proper TV-style scorebar*
    │                                                          │
    │                                                          │
    │ ──────────────────────────────────────────────────────── │
-   │  HOME XI                 127/4  │  VISITING XI    —      │
+   │  YOUR CLUB CC            127/4  │  AWAY CC        —      │
    │                                  │                  14.2 │
    └──────────────────────────────────────────────────────────┘
                                                        Overs ↑
@@ -78,7 +78,7 @@ Open the YouTube link → see the match → see the scorebar across the bottom u
 ```
    ✅ Cloudflare server built and deployed
         URL: https://<your-worker>.workers.dev
-              (and https://cricket-overlay.stayd.workers.dev as fallback)
+              (and https://<your-worker>.workers.dev as fallback)
 
    ✅ Scorebar webpage works against real Play-Cricket data
         Three concurrent overlays — default, 3rd XI, 4th XI — each with
@@ -94,6 +94,17 @@ Open the YouTube link → see the match → see the scorebar across the bottom u
         Scorer keeps a 5× vote weight via a signed cookie. Per-IP rate
         limits stop spam. Auto-ranked highlight reel at /reel uses
         events + crowd reactions to surface top moments.
+
+   ✅ Match-health dashboard shipped
+        /admin/diagnose answers "is THIS match healthy right now?" —
+        score freshness, fallback mode, data source, scrape errors —
+        all colour-coded on one page that auto-refreshes.
+
+   ✅ Mock-seed for demos
+        One button in the admin page seeds a fake match (~30 events,
+        ~80 tags, ~50 reactions) so highlights / summary / reel / share
+        cards / clip embeds all light up without a live game. Useful
+        for showing the project off, and for pre-match dry runs.
 
    🟡 OBS + YouTube end-to-end at a real match — DEPENDENT ON FIXTURE
         Software side proven. Camera + on-the-day workflow needs a live test.
@@ -248,10 +259,12 @@ Once the boring scorebar was reliable, the project grew into a proper club-crick
                    the match, each one tappable to jump to that
                    exact moment on YouTube.
 
-   /summary        End-of-match recap. Big scoreline, top
-                   performers, full wagon wheel, share-friendly
-                   meta tags so the page previews nicely on
-                   WhatsApp.
+   /summary        End-of-match recap. Big scoreline, "final state"
+                   panel (the not-out pair, bowler, partnership, last
+                   over with each ball colour-coded), top performers,
+                   full wagon wheel, share-friendly meta tags so the
+                   page previews nicely on WhatsApp. Add ?mock=1 to
+                   preview the layout against fake numbers.
 
    /tag            (Scorer-only, key-protected.) Tap-to-tag
                    wagon-wheel UI. Pick the zone the ball went to,
@@ -268,6 +281,17 @@ Once the boring scorebar was reliable, the project grew into a proper club-crick
    /share/…/N.svg  A share-card image per wicket/boundary —
                    "BOUNDARY · R. Smith · over 14.3" — for
                    posting in club groups or social.
+
+   /admin/diagnose (Admin only.) One-page health check for a single
+                   match: how fresh the cached score is, whether the
+                   official Play-Cricket token or the fallback is being
+                   used, whether ball-by-ball data is flowing, and
+                   recent scrape rows. Auto-refreshes every 15 seconds.
+
+   /admin/mock-seed (Admin only — a button on the admin page.) Writes
+                   a fake match's worth of events, tags and reactions
+                   so the live / highlights / summary / reel pages all
+                   populate immediately. For demos and dry runs.
 ```
 
 ### Wagon wheel + shot type, in pictures
@@ -408,11 +432,13 @@ What to look for during a match:
 
 There's a "Auto-refresh (5s)" tickbox so you can leave it open on a second screen during a match.
 
+**The match-health page** (`/admin/diagnose`) is the companion view. The logs page tells you "is the API alive at all?". The diagnose page tells you "is *this specific match* healthy right now?" — at a glance you see the freshness of the cached score, whether we're reading from the official Play-Cricket API or the fallback, whether ball-by-ball data is actually arriving (some matches are scored totals-only and won't have a recent-balls strip), and the last few scrape rows for context. Each check is green / amber / red so a glance tells you everything. It auto-refreshes every 15 seconds.
+
 ### Cost (still)
 
 ```
    Cloudflare server:    £0  (free tier, well under limits)
-   Domain:               £0  (<your domain> — bring your own)
+   Domain:               £0  (<your-worker>.workers.dev — already on Brand)
    YouTube streaming:    £0
    ───────────────────────────
    Software running:     £0/month
@@ -427,7 +453,7 @@ Held back until we have appetite/evidence:
 ```
    ✗ Multi-camera switching / replays
    ✗ Login / per-user accounts
-   ✗ Multi-club rollout (the scope system is ready, but only one club plumbed in by default)
+   ✗ Multi-source rollout (the scope system is ready, but only Play-Cricket plumbed in)
    ✗ Player career stats across seasons (planned in Tier 3 of BACKLOG.md)
    ✗ AI auto-commentary / match reports (planned in Tier 5)
    ✗ Share cards as PNG (currently SVG — works inline, not in WhatsApp previews)

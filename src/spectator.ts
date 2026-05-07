@@ -217,6 +217,34 @@ export function renderSpectator(matchId: string, scope = ''): string {
   .clip .meta { color: var(--muted); font-weight: 500; font-size: 11px; }
   .clip .play { color: var(--accent); }
 
+  .clip-wrap {
+    flex: 0 0 auto;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .clip-wrap .clip { width: 100%; }
+  .vibes {
+    display: flex; gap: 4px; flex-wrap: nowrap;
+  }
+  .vibe-btn {
+    flex: 0 0 auto;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 4px 7px;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 4px;
+    font-variant-numeric: tabular-nums;
+    transition: transform .1s ease, border-color .12s ease, background .12s ease;
+  }
+  .vibe-btn:hover { border-color: var(--accent); }
+  .vibe-btn:active { transform: scale(0.94); }
+  .vibe-btn[disabled] { opacity: 0.55; cursor: default; }
+  .vibe-btn .vc { color: var(--muted); font-weight: 700; font-size: 11px; }
+  .vibe-btn.has .vc { color: var(--accent); }
+
   .wheel-card {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 10px; padding: 14px 16px; margin-top: 12px;
@@ -255,6 +283,12 @@ export function renderSpectator(matchId: string, scope = ''): string {
   var lastWheelTotal = -1;
   var lastWheelLastTaggedAt = -1;
   var ZONE_LABELS = ['Dot','Straight','Cover','Point','Third','Fine','Fine leg','Sq leg','Midwicket'];
+  var VIBE_EMOJIS = ['🔥','😮','🎯','👏','😂'];
+  var vibeMap = {};       // "i:o.b" → emoji → count (server snapshot + optimistic bumps)
+  var vibeDisabled = {};  // ballKey + '|' + emoji → timeout id (disabled until cleared)
+  var lastEventsPayload = null; // re-render clips when vibes update
+
+  function $(id) { return document.getElementById(id); }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, function(c){
@@ -434,11 +468,44 @@ export function renderSpectator(matchId: string, scope = ''): string {
     if (e.type === 'hundred') return 'hundred';
     return '';
   }
+  function ballKeyForEvent(e) {
+    // event.over is a string like "14.3"; key is "innings:over.ball"
+    var inn = (e.innings != null) ? e.innings : 1;
+    return inn + ':' + (e.over || '');
+  }
+  function parseOverBall(overStr) {
+    var s = String(overStr || '');
+    var dot = s.indexOf('.');
+    if (dot < 0) return null;
+    var o = parseInt(s.slice(0, dot), 10);
+    var b = parseInt(s.slice(dot + 1), 10);
+    if (isNaN(o) || isNaN(b)) return null;
+    return { over: o, ball: b };
+  }
+  function vibesRowHtml(e) {
+    var key = ballKeyForEvent(e);
+    var counts = vibeMap[key] || {};
+    var html = '<div class="vibes" data-vibe-key="' + escapeHtml(key) + '">';
+    for (var i = 0; i < VIBE_EMOJIS.length; i++) {
+      var em = VIBE_EMOJIS[i];
+      var c = counts[em] || 0;
+      var disabledKey = key + '|' + em;
+      var dis = vibeDisabled[disabledKey] ? ' disabled' : '';
+      html += '<button type="button" class="vibe-btn' + (c ? ' has' : '') + '"' + dis +
+        ' data-emoji="' + escapeHtml(em) + '"' +
+        ' data-ball-key="' + escapeHtml(key) + '">' +
+        '<span class="ve">' + em + '</span><span class="vc">' + c + '</span></button>';
+    }
+    html += '</div>';
+    return html;
+  }
   function renderClips(payload) {
     var host = $('clips');
     if (!host) return;
-    var events = payload.events || [];
-    var youtube = payload.youtube;
+    if (payload) lastEventsPayload = payload;
+    var src = lastEventsPayload || { events: [] };
+    var events = src.events || [];
+    var youtube = src.youtube;
     if (!events.length) { host.style.display = 'none'; return; }
     host.style.display = '';
     var last = events.slice(-6).reverse();
@@ -447,31 +514,89 @@ export function renderSpectator(matchId: string, scope = ''): string {
       var e = last[i];
       var idx = events.length - 1 - i; // original index for clip route
       var who = e.batter || (e.type === 'team-milestone' ? '' : 'Batter');
+      var clipHtml = '';
       if (youtube) {
         var off = Math.max(0, Math.floor((e.ts - youtube.startedAt) / 1000));
         var href = 'https://www.youtube.com/watch?v=' + encodeURIComponent(youtube.videoId) + '&t=' + off + 's';
-        html += '<a class="clip ' + eventClass(e) + '" href="' + href + '" target="_blank" rel="noopener">';
-        html += '<span class="kind">' + eventTitle(e) + '</span>';
-        html += '<span>' + escapeHtml(who) + '</span>';
-        html += '<span class="meta">· ' + escapeHtml(e.over) + '</span>';
-        html += '<span class="play">▶</span>';
-        html += '</a>';
+        clipHtml += '<a class="clip ' + eventClass(e) + '" href="' + href + '" target="_blank" rel="noopener">';
+        clipHtml += '<span class="kind">' + eventTitle(e) + '</span>';
+        clipHtml += '<span>' + escapeHtml(who) + '</span>';
+        clipHtml += '<span class="meta">· ' + escapeHtml(e.over) + '</span>';
+        clipHtml += '<span class="play">▶</span>';
+        clipHtml += '</a>';
       } else {
         var clipPath = (SCOPE ? '/' + SCOPE : '') + '/embed/clip/' + encodeURIComponent(MATCH_ID) + '/' + idx;
-        html += '<a class="clip ' + eventClass(e) + '" href="' + clipPath + '" target="_blank" rel="noopener">';
-        html += '<span class="kind">' + eventTitle(e) + '</span>';
-        html += '<span>' + escapeHtml(who) + '</span>';
-        html += '<span class="meta">· ' + escapeHtml(e.over) + '</span>';
-        html += '</a>';
+        clipHtml += '<a class="clip ' + eventClass(e) + '" href="' + clipPath + '" target="_blank" rel="noopener">';
+        clipHtml += '<span class="kind">' + eventTitle(e) + '</span>';
+        clipHtml += '<span>' + escapeHtml(who) + '</span>';
+        clipHtml += '<span class="meta">· ' + escapeHtml(e.over) + '</span>';
+        clipHtml += '</a>';
       }
+      html += '<div class="clip-wrap">' + clipHtml + vibesRowHtml(e) + '</div>';
     }
     host.innerHTML = html;
   }
   function fetchEvents() {
     if (IS_MOCK) return;
     var url = (SCOPE ? '/' + SCOPE : '') + '/api/events/' + encodeURIComponent(MATCH_ID);
-    fetch(url, { cache: 'no-store' }).then(function(r){ return r.json(); }).then(renderClips).catch(function(){});
+    fetch(url, { cache: 'no-store' }).then(function(r){ return r.json(); }).then(function(p){ renderClips(p); }).catch(function(){});
   }
+
+  // ------- vibe reactions ----------------------------------------------
+  function fetchVibes() {
+    if (IS_MOCK) { renderClips(null); return; }
+    var url = (SCOPE ? '/' + SCOPE : '') + '/api/vibes/' + encodeURIComponent(MATCH_ID);
+    fetch(url, { cache: 'no-store', credentials: 'same-origin' })
+      .then(function(r){ return r.json(); })
+      .then(function(p){
+        vibeMap = (p && p.vibes) || {};
+        renderClips(null);
+      })
+      .catch(function(){});
+  }
+  function handleVibeClick(ev) {
+    var btn = ev.target;
+    while (btn && btn !== document.body && (!btn.classList || !btn.classList.contains('vibe-btn'))) {
+      btn = btn.parentNode;
+    }
+    if (!btn || !btn.classList || !btn.classList.contains('vibe-btn')) return;
+    if (btn.disabled) return;
+    var key = btn.getAttribute('data-ball-key');
+    var emoji = btn.getAttribute('data-emoji');
+    if (!key || !emoji) return;
+
+    // Optimistic local increment
+    vibeMap[key] = vibeMap[key] || {};
+    vibeMap[key][emoji] = (vibeMap[key][emoji] || 0) + 1;
+    var vc = btn.querySelector('.vc');
+    if (vc) vc.textContent = vibeMap[key][emoji];
+    btn.classList.add('has');
+
+    // Disable for 600ms
+    var disKey = key + '|' + emoji;
+    btn.disabled = true;
+    vibeDisabled[disKey] = setTimeout(function(){
+      delete vibeDisabled[disKey];
+      btn.disabled = false;
+    }, 600);
+
+    if (IS_MOCK) return; // mock: no-op POST
+
+    var colon = key.indexOf(':');
+    if (colon < 0) return;
+    var innings = parseInt(key.slice(0, colon), 10);
+    var ob = parseOverBall(key.slice(colon + 1));
+    if (!ob || isNaN(innings)) return;
+    var url = (SCOPE ? '/' + SCOPE : '') + '/api/vibe/' + encodeURIComponent(MATCH_ID) +
+      '/' + innings + '/' + ob.over + '/' + ob.ball;
+    fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emoji: emoji }),
+    }).catch(function(){});
+  }
+  document.addEventListener('click', handleVibeClick);
 
   // ------- live wagon wheel --------------------------------------------
   function buildWheelSvg(counts) {
@@ -547,9 +672,11 @@ export function renderSpectator(matchId: string, scope = ''): string {
   fetchScore();
   fetchEvents();
   fetchTags();
+  fetchVibes();
   setInterval(fetchScore, POLL_MS);
   setInterval(fetchEvents, POLL_MS);
   setInterval(fetchTags, POLL_MS);
+  setInterval(fetchVibes, POLL_MS);
 })();
 </script>
 </body>

@@ -14,6 +14,7 @@ const TYPE_STYLES: Record<MatchEvent['type'], { label: string; accent: string; i
   fifty: { label: 'FIFTY', accent: '#ffd23a', icon: '50' },
   hundred: { label: 'HUNDRED', accent: '#ffd23a', icon: '100' },
   'team-milestone': { label: 'MILESTONE', accent: '#3ddc84', icon: '·' },
+  moment: { label: 'MOMENT', accent: '#c9b46c', icon: '★' },
 };
 
 /**
@@ -25,7 +26,8 @@ export async function renderShareCardSvg(
   matchId: string,
   scope: string,
   eventIdx: number,
-  branding: BrandingConfig,
+  _branding: BrandingConfig,
+  caption?: string,
 ): Promise<string> {
   const events = await readEvents(env, matchId);
   const evt = Number.isFinite(eventIdx) && eventIdx >= 0 && eventIdx < events.length ? events[eventIdx] : null;
@@ -37,7 +39,10 @@ export async function renderShareCardSvg(
 
   const style = TYPE_STYLES[evt.type] ?? { label: evt.type.toUpperCase(), accent: '#8a93a4', icon: '·' };
   const headline = headlineFor(evt);
-  const subline = sublineFor(evt);
+  // Prefer the AI caption as the subline when present — it carries shot
+  // type / bowler / over in one human sentence. Fall back to the existing
+  // mechanical line when the caption is absent or empty.
+  const subline = (caption && caption.trim()) ? caption.trim() : sublineFor(evt);
 
   const W = 1200, H = 630;
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
@@ -71,7 +76,6 @@ export async function renderShareCardSvg(
 
   <!-- footer -->
   <text x="60" y="${H - 50}" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="700" fill="#8a93a4" letter-spacing="3">OVER ${escapeXml(evt.over)} · INNINGS ${evt.innings}</text>
-  ${branding.footerText ? `<text x="${W - 60}" y="${H - 50}" text-anchor="end" font-family="Helvetica,Arial,sans-serif" font-size="20" font-weight="700" fill="#ffd23a" letter-spacing="3">${escapeXml(branding.footerText)}</text>` : ''}
 </svg>`;
 }
 

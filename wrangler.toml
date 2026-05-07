@@ -8,20 +8,40 @@ compatibility_date = "2025-05-01"
 binding = "CRICKET_CACHE"
 id = ""
 
+# Workers AI binding — used by /report, /api/commentary and /api/captions
+# for AI summaries, per-over commentary, and share-card captions. Free
+# during the open beta. Required to deploy.
+[ai]
+binding = "AI"
+
+# D1 database for scrape audit logs (/admin/logs) and the per-match archive
+# (/archive, career pages, head-to-head). Required to deploy.
+# Set up:
+#   npx wrangler d1 create cricket-logs
+#   npx wrangler d1 execute cricket-logs --file=migrations/0001_scrape_log.sql
+#   npx wrangler d1 execute cricket-logs --file=migrations/0002_match_archive.sql
+# Then paste the returned database id below.
+[[d1_databases]]
+binding = "LOG_DB"
+database_name = "cricket-logs"
+database_id = ""
+
 # Bundle .md files as raw text so /docs can serve non_tech_spec.md.
 [[rules]]
 type = "Text"
 globs = ["**/*.md"]
 fallthrough = true
 
-# Optional: enable scrape audit logging in D1.
-# Run `npx wrangler d1 create cricket-logs`, paste the id below, then
-# `npx wrangler d1 execute cricket-logs --file=migrations/0001_scrape_log.sql`.
-# [[d1_databases]]
-# binding = "LOG_DB"
-# database_name = "cricket-logs"
-# database_id = ""
+# Bundle .wasm files as compiled WebAssembly modules so resvg-wasm can be
+# initialised at request time (used by the PNG share-card route).
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = true
 
-# Optional: set the home page to scrape for fixture auto-discovery.
+# Optional: set the home page to scrape for fixture auto-discovery. When
+# unset, /api/discover returns an empty list and the admin UI shows no
+# auto-discovered fixture picker (you can still paste a Play-Cricket match
+# id directly).
 # [vars]
 # DISCOVERY_HOME_URL = "https://yourclub.play-cricket.com/home"

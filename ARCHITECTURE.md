@@ -53,7 +53,7 @@ Public:
 - `GET /` — landing page with links to each scope's overlay/mock/admin and the plain-English spec.
 - `GET /docs` (alias `/docs/non-tech-spec`) — renders `non_tech_spec.md` from the repo root, bundled at build time via wrangler's `[[rules]] type = "Text"` text-import. Single source of truth: edit the markdown, redeploy, page updates.
 - `GET /api/score/:matchId` — JSON `Score`. `?mock=1` returns a fake ticking score, bypassing scraper + KV.
-- `GET /api/discover` — JSON list of auto-discovered fixtures from Play-Cricket. Cached 5 min in KV (`fixtures:home`). Requires `DISCOVERY_HOME_URL`.
+- `GET /api/discover` — JSON list of fixtures from `DISCOVERY_HOME_URL` (a Play-Cricket club home page). Cached 5 min in KV (`fixtures:playcricket`). Returns `[]` when unset.
 - `GET [/scope]/api/tags/:matchId` — JSON `{ counts: number[9], shots: Record<ShotType,number>, total, lastTaggedAt }`. Drives the live wagon wheel on the spectator page.
 - `GET [/scope]/api/events/:matchId` — JSON `{ events: MatchEvent[], youtube: YouTubeConfig | null }`. Drives the per-ball clip strip on the spectator page.
 - `POST [/scope]/api/vibe/:matchId/:innings/:over/:ball` — `{ emoji }` ∈ `🔥 😮 🎯 👏 😂` → bumps the matching counter. Open (no auth), rate-limited.
@@ -159,7 +159,7 @@ Single self-contained HTML doc per request, no external assets, transparent back
 
 ### Layout (top → bottom of screen)
 
-- **Top-left brand block** — optional header logo (set via admin) + scope chip (`3rd XI` / `4th XI` only when scope is set; default scope shows no chip).
+- **Top-left brand block** — configurable header logo + secondary mark + scope chip (`3rd XI` / `4th XI` only when scope is set; default scope shows no chip). Logo slots are empty by default — paste your own base64 data URIs into `src/assets.ts`.
 - **Mid-screen flash overlay** — full-viewport "WICKET!" / "50" / "100" graphics. 5s for wickets, 4s for milestones. Triggered client-side by deltas across polls.
 - **Bottom stack** (transparent, anchored 16px above the bottom edge for YouTube safe area):
   - **Sponsor strip** (only when sponsors configured) — rotating per-sponsor card.
@@ -174,17 +174,21 @@ Single self-contained HTML doc per request, no external assets, transparent back
 - **Bump**: score, batter score, bowler figures briefly scale + flash gold when their numeric value increases between polls.
 - **Flash**: full-viewport overlay with a gold/red colour and large headline. Triggered on wicket and 50/100 batter milestones. Suppressed on the first poll so initial-load deltas don't fire.
 
-### Image assets — runtime config only
+### Inlined image assets
 
-The OSS fork ships **no hardcoded logos**. Header logos and team crests are loaded from URLs you set in the admin UI; the overlay HTML interpolates them in at render time. If you want zero-runtime-fetch overlays, host your logos as small PNGs/SVGs on a CDN (or as a Worker static asset) and paste the URL into the admin form. There is no `assets.ts`.
+Workers don't serve static files, so all overlay imagery is base64-embedded in `src/assets.ts` and string-interpolated into the HTML at render time:
+
+- `BRAND_LOGO_DATA_URI` — header logo for the top-left brand block. Empty default → slot is hidden.
+- `BRAND_MASCOT_DATA_URI` — secondary mark sitting next to the header logo. Empty default → slot is hidden.
+
+Drop in your own by base64-encoding a PNG (`printf 'data:image/png;base64,'; base64 -i logo.png` on macOS) and pasting into the relevant constant. Keep them small (~50KiB encoded) — the whole HTML doc ships on every overlay request.
 
 ### Branding (KV-driven, per scope)
 
 `/<scope>/admin` writes JSON into KV which is read at overlay render time and inlined into the HTML:
 
 - `branding:sponsors[:scope]` — `[{ name, imageUrl?, text?, durationMs? }]`. Rotated client-side every `durationMs` (default 12s).
-- `branding:teams[:scope]` — `{ "<case-insensitive substring>": { primary?, secondary?, crestUrl? } }`. Substring match: `"acme"` matches "Acme CC 1st XI". Overrides the default yellow accent and (optionally) the crest URL when the team is on screen.
-- `branding:meta[:scope]` — `{ headerLogoUrl?, footerText? }`. The header logo URL drives the top-left brand block on the overlay; the footer text is inlined into share-card SVGs and the summary page.
+- `branding:teams[:scope]` — `{ "<case-insensitive substring>": { primary?, secondary?, crestUrl? } }`. Substring match: `"shire"` matches "Shire CC, 1st XI". Overrides the default yellow accent and (optionally) the crest URL when the team is on screen.
 
 ## Scrape log (D1)
 
@@ -273,18 +277,18 @@ The tagger is now open — anyone with the URL can vote. Scorer status is confer
 
 ## Worker bindings
 
-- `CRICKET_CACHE` — KV namespace (paste your own ID into `wrangler.toml`). Holds score cache, mapping cache, active-match pointers, branding config.
-- `LOG_DB` — optional D1 binding (uncomment and configure in `wrangler.toml`). Holds the `scrape_log` audit trail.
+- `CRICKET_CACHE` — KV namespace. Holds score cache, mapping cache, active-match pointers, branding config. Create with `npx wrangler kv namespace create CRICKET_CACHE` and paste the id into `wrangler.toml`.
+- `LOG_DB` — D1 database `cricket-logs`. Holds the `scrape_log` audit trail and the per-match archive. Create with `npx wrangler d1 create cricket-logs`, run both migrations in `migrations/`, and paste the id into `wrangler.toml`.
 - `PLAY_CRICKET_API_TOKEN` — secret, optional. If unset, ResultsVault path is used.
 - `ADMIN_KEY` — secret, required for the default-scope admin URL.
 - `ADMIN_KEY_3S` — secret, required for the `/3s/admin` URL.
 - `ADMIN_KEY_4S` — secret, required for the `/4s/admin` URL.
 
-Set secrets with `npx wrangler secret put <NAME>`. Store admin keys in your secrets manager of choice.
+Set secrets with `npx wrangler secret put <NAME>`.
 
 ## Deployment
 
-`*.workers.dev` host: `cricket-overlay.stayd.workers.dev`. No custom domain.
+`*.workers.dev` host: `<your-worker>.workers.dev`. No custom domain.
 
 ## Backlog
 

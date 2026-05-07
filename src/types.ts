@@ -71,12 +71,19 @@ export type Score = {
 
 export type Env = {
   CRICKET_CACHE: KVNamespace;
-  /** Optional D1 binding. When set, scrape attempts are logged to the `scrape_log` table (see migrations/). */
-  LOG_DB?: D1Database;
+  LOG_DB: D1Database;
+  AI: Ai;
   PLAY_CRICKET_API_TOKEN?: string;
   ADMIN_KEY?: string;
   ADMIN_KEY_3S?: string;
   ADMIN_KEY_4S?: string;
-  /** Optional URL to scrape for fixture auto-discovery (e.g. your club's Play-Cricket home page). */
+  // Google Cloud "YouTube Data API v3" key. Used to look up the broadcast's
+  // actualStartTime so per-event YouTube deep-links use YouTube's wall-clock
+  // rather than whenever the admin pasted the URL. Optional — falls back to
+  // Date.now() when absent.
+  YOUTUBE_API_KEY?: string;
+  // Optional — Play-Cricket club home page used by fixture auto-discovery
+  // (e.g. `https://yourclub.play-cricket.com/home`). When unset, `/api/discover`
+  // returns an empty list and the admin UI shows no fixture picker.
   DISCOVERY_HOME_URL?: string;
 };
